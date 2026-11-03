@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Review Cockpit for GitHub",
   "short_name": "Review Cockpit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A faster, keyboard-first pull request review experience layered on top of GitHub.",
   "icons": {
     "16": "icons/icon16.png",

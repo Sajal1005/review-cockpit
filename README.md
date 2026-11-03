@@ -56,6 +56,11 @@ Files are ranked **High → Medium → Low risk**, and each one shows why: `secu
 - Files that changed after you marked them viewed get a dot.
 - The **Conversations** tab lists every unresolved review thread and tags it **code changed** when the code under a comment has been modified since. That's usually the sign your feedback was addressed.
 
+### 🧭 Explore code without leaving the review
+
+- **"What method am I looking at?"** The **Code** tab lists every changed section of the current file with the function or type it belongs to, like `func relabel(cfg *Config, lb *labels.Builder) (keep bool)`, and its line range. Click to jump to it, or **view function** to read the whole function in the sidebar.
+- **Go to definition.** Select any name in the diff and press <kbd>Alt</kbd>+<kbd>G</kbd>. Its definition and usages open in the sidebar, from the PR's own code (so brand-new functions work too) and from the rest of the repo.
+
 ### 🤖 AI review, with you in charge
 
 Click **Run AI review** and Claude reads the diff, then lists likely bugs, security problems and missing tests, each with a severity and an exact file and line.
@@ -64,7 +69,17 @@ Click **Run AI review** and Claude reads the diff, then lists likely bugs, secur
 - Click **Add as draft comment** to put it in your *pending* GitHub review. Nothing is visible to anyone until you click **Finish your review** on GitHub.
 - It uses **your own Anthropic API key** with Claude Opus 5.5 (or Sonnet 5.5 for speed). There's no server in between.
 
-Prefer your own tools? **Copy for AI** copies the PR description and the cleaned-up diff, with a review prompt, ready to paste into Claude, ChatGPT, Cursor or any agent.
+**Use your own agent instead.** No API hacking needed:
+
+1. Click **Copy for AI**. You get the PR description and the cleaned-up, line-numbered diff, with a prompt that asks for findings in a simple JSON format.
+2. Paste it into Claude Code, Cursor, ChatGPT or any agent.
+3. Paste the agent's answer into **AI review → Import findings**, then click **Add all as draft comments**.
+
+The format is plain JSON, so any script or agent can produce it:
+
+```json
+{"findings": [{"path": "src/auth/session.ts", "line": 43, "severity": "high", "title": "…", "explanation": "…", "suggestion": "…"}]}
+```
 
 ### ⌨️ Keyboard-first
 
@@ -111,6 +126,7 @@ To update later, `git pull` (or download the ZIP again), then click ↻ on the e
 | <kbd>Alt</kbd> + <kbd>J</kbd> / <kbd>K</kbd> | Next / previous file |
 | <kbd>Alt</kbd> + <kbd>N</kbd> | Next unviewed file |
 | <kbd>Alt</kbd> + <kbd>V</kbd> | Toggle *Viewed* and jump to the next unviewed file |
+| <kbd>Alt</kbd> + <kbd>G</kbd> | Go to the definition of the selected name |
 | <kbd>Alt</kbd> + <kbd>/</kbd> | Filter files |
 | <kbd>Alt</kbd> + <kbd>R</kbd> | Show / hide the panel |
 
@@ -193,6 +209,8 @@ For panel problems, open DevTools on the GitHub page (<kbd>F12</kbd> → Console
 - [x] AI review with findings added as pending review comments
 - [x] Unresolved conversations with "code changed" detection
 - [x] Review queue with "updated since you reviewed"
+- [x] Function context for every change, and go-to-definition in the sidebar
+- [x] Import findings from any AI agent as draft comments
 - [ ] Live sync of GitHub's on-page *Viewed* checkboxes and pending comments
 - [ ] AI re-review: check whether each of your earlier comments was actually addressed by the new commits
 - [ ] "Explain this hunk" on any diff selection

@@ -34,6 +34,8 @@
   let cursorPath = null; // file the keyboard cursor is on
   let since = null; // { from, to, at, paths: Set | null } when there are commits after your last review
   let ai = newAiState();
+  let code = newCodeState();
+  let diffCache = null; // { head, promise: Promise<Map<path, fileDiff>> }
   let error = null;
   let fetchedAt = 0;
   let query = '';
@@ -44,6 +46,11 @@
 
   function newAiState() {
     return { status: null, running: false, result: null, error: null };
+  }
+
+  function newCodeState() {
+    // outline: changed sections of the cursor file; results/viewer: symbol lookup
+    return { outlineFor: null, outline: null, outlineError: null, query: '', searching: false, results: null, error: null, viewer: null };
   }
 
   // -------------------------------------------------------------------------
@@ -72,6 +79,7 @@
       if (pr !== target) return;
       const risk = RC.assessRisk(enriched);
       for (const f of enriched) f.risk = risk.get(f.path);
+      if (data && data.headRefOid !== d.headRefOid) code.outlineFor = null; // new push: re-read sections
       data = d;
       files = RC.sortFiles(enriched);
       fetchedAt = Date.now();
@@ -117,6 +125,86 @@
     chrome.storage.local.set({ [`ai:${key}`]: result }).catch(() => {});
   }
 
+  // The PR diff split per file, fetched once per head commit.
+  function fileDiffs() {
+    if (!diffCache || diffCache.head !== data.headRefOid) {
+      const promise = send('getDiff', { owner: pr.owner, repo: pr.repo, number: pr.number }).then(
+        (text) => new Map(RC.splitDiff(text).map((c) => [c.path, c.text])),
+      );
+      diffCache = { head: data.headRefOid, promise };
+      promise.catch(() => {
+        if (diffCache?.promise === promise) diffCache = null;
+      });
+    }
+    return diffCache.promise;
+  }
+
+  function readFile(path, ref) {
+    return send('getFile', { owner: pr.owner, repo: pr.repo, ref, path }).then((text) => text.split('\n'));
+  }
+
+  // "What method am I looking at?": each changed section of a file with the function around it.
+  async function loadOutline(f) {
+    const state = code;
+    state.outlineFor = f.path;
+    state.outline = null;
+    state.outlineError = null;
+    try {
+      const chunk = (await fileDiffs()).get(f.path);
+      if (!chunk) throw new Error("GitHub didn't include this file in the diff. It may be binary or too large.");
+      let lines = null;
+      if (f.changeType !== 'DELETED') lines = await readFile(f.path, data.headRefOid).catch(() => null);
+      state.outline = RC.parseHunks(chunk).map((hunk) => {
+        const fn = lines ? RC.enclosingFunction(lines, hunk.firstChange) : null;
+        return { ...hunk, fn: fn?.text || hunk.context || null, fnLine: fn?.line ?? null };
+      });
+    } catch (err) {
+      state.outlineError = err;
+    }
+    if (code === state && state.outlineFor === f.path) renderCode();
+  }
+
+  // "Go to definition / references" without leaving the review.
+  async function lookup(symbol) {
+    if (!data) return;
+    const state = code;
+    Object.assign(state, { query: symbol, searching: true, results: null, error: null, viewer: null });
+    els.symbol.value = symbol;
+    renderCode();
+    const paths = files
+      .filter((f) => !f.noise && f.changeType !== 'DELETED' && (f.category === 'source' || f.category === 'test'))
+      .map((f) => f.path);
+    try {
+      state.results = await send('findSymbol', { owner: pr.owner, repo: pr.repo, symbol, head: data.headRefOid, paths });
+    } catch (err) {
+      state.error = err;
+    }
+    state.searching = false;
+    if (code === state) renderCode();
+  }
+
+  async function openViewer(item) {
+    const state = code;
+    state.viewer = { ...item, loading: true };
+    renderCode();
+    try {
+      const lines = await readFile(item.path, item.ref);
+      let line = item.line;
+      if (!line && state.query) {
+        const isDefinition = RC.definitionRegex(state.query);
+        const i = lines.findIndex((l) => isDefinition.test(l));
+        line = i >= 0 ? i + 1 : lines.findIndex((l) => l.includes(state.query)) + 1;
+      }
+      state.viewer = { ...item, line: line || 1, lines, loading: false };
+    } catch (err) {
+      state.viewer = { ...item, error: err, loading: false };
+    }
+    if (code === state) {
+      renderCode();
+      els.codeView.scrollTop = 0;
+    }
+  }
+
   function isChanged(f) {
     return f.viewedState === 'DISMISSED' || !!since?.paths?.has(f.path);
   }
@@ -160,6 +248,7 @@
   function select(f, line) {
     cursorPath = f.path;
     renderList();
+    if (prefs.tab === 'code') renderCode();
     openFile(f, line);
     if (!prefs.open) toast(f.path);
   }
@@ -214,7 +303,9 @@
       const tokens = `≈${Math.max(1, Math.round(text.length / 4000))}k tokens`;
       try {
         await navigator.clipboard.writeText(text);
-        toast(`Copied (${tokens}). Paste it into your AI agent.${removed.length ? ` Left out ${removed.length} generated/lock files.` : ''}`);
+        toast(
+          `Copied (${tokens}). Paste it into your AI agent, then paste its answer into AI review → Import to turn findings into draft comments.${removed.length ? ` Left out ${removed.length} generated/lock files.` : ''}`,
+        );
       } catch {
         showText(text); // clipboard can be blocked if the page lost focus
       }
@@ -266,14 +357,80 @@
     }
   }
 
+  function commentBody(finding) {
+    return `**${finding.title}**\n\n${finding.explanation}${finding.suggestion ? `\n\n**Suggestion:** ${finding.suggestion}` : ''}`;
+  }
+
+  function addDraft(finding) {
+    return send('addDraftComment', { pullRequestId: data.id, path: finding.path, line: finding.line, body: commentBody(finding) });
+  }
+
+  async function postAll(btn) {
+    const state = ai;
+    const key = pr.key;
+    const pending = state.result.findings.filter((f) => f.state === 'new');
+    btn.disabled = true;
+    let added = 0;
+    let failed = 0;
+    for (const finding of pending) {
+      btn.textContent = `Adding ${added + failed + 1}/${pending.length}…`;
+      try {
+        await addDraft(finding);
+        finding.state = 'posted';
+        added++;
+      } catch {
+        failed++;
+      }
+    }
+    saveAi(key, state.result);
+    toast(
+      `Added ${added} draft comment${added === 1 ? '' : 's'}${failed ? `; ${failed} couldn't be placed (line outside the diff)` : ''}. Submit them with "Finish your review" on GitHub.`,
+    );
+    if (ai === state) {
+      renderAi();
+      renderTabs();
+    }
+  }
+
+  // Findings from any agent (Claude Code, Cursor, a chat window…) become one-click draft comments.
+  function importFindings() {
+    let found;
+    try {
+      found = RC.parseFindings(els.importInput.value);
+    } catch (err) {
+      return toast(err.message);
+    }
+    const known = new Set(files.map((f) => f.path));
+    const findings = found.map((f) => ({ ...f, state: 'new' }));
+    const unknown = findings.filter((f) => !known.has(f.path)).length;
+    if (ai.result && ai.result.headRefOid === data.headRefOid) {
+      ai.result.findings.push(...findings);
+      ai.result.findings.sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
+    } else {
+      ai.result = {
+        headRefOid: data.headRefOid,
+        at: new Date().toISOString(),
+        modelName: 'Your agent',
+        summary: `Imported ${findings.length} finding${findings.length === 1 ? '' : 's'} from your own agent.`,
+        removed: [],
+        findings: findings.sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]),
+      };
+    }
+    saveAi(pr.key, ai.result);
+    els.importInput.value = '';
+    els.importBox.hidden = true;
+    renderAi();
+    renderTabs();
+    toast(`Imported ${findings.length} finding${findings.length === 1 ? '' : 's'}.${unknown ? ` ${unknown} point at files that aren't in this PR.` : ''}`);
+  }
+
   async function postFinding(finding, btn) {
     const state = ai;
     const key = pr.key;
     btn.disabled = true;
     btn.textContent = 'Adding…';
-    const body = `**${finding.title}**\n\n${finding.explanation}${finding.suggestion ? `\n\n**Suggestion:** ${finding.suggestion}` : ''}`;
     try {
-      await send('addDraftComment', { pullRequestId: data.id, path: finding.path, line: finding.line, body });
+      await addDraft(finding);
       finding.state = 'posted';
       saveAi(key, state.result);
       toast('Added to your pending review. Submit it with "Finish your review" on GitHub (reload to see it there).');
@@ -303,6 +460,7 @@
     prefs.tab = tab;
     savePrefs();
     renderTabs();
+    if (tab === 'code') renderCode();
   }
 
   function setOpen(open) {
@@ -333,6 +491,7 @@
     renderTabs();
     renderList();
     renderThreads();
+    renderCode();
     renderAi();
     renderLauncher();
   }
@@ -412,6 +571,7 @@
     const counts = {
       files: files.length ? `${files.filter((f) => f.viewedState !== 'VIEWED').length}` : '',
       threads: threads ? `${threads}` : '',
+      code: '',
       ai: ai.running ? '…' : open ? `${open}` : '',
     };
     for (const [tab, button] of Object.entries(els.tabs)) {
@@ -516,40 +676,58 @@
     const box = els.aiView;
     if (!data) return box.replaceChildren(h('div', { class: 'empty' }, 'Loading pull request…'));
     const { status, running, result, error: aiError } = ai;
+    const configured = !!status?.configured;
+    const modelName = status?.modelName ?? 'Claude';
+    const parts = [];
 
-    if (status && !status.configured) {
-      return box.replaceChildren(
+    if (status && !configured) {
+      parts.push(
         h(
           'div',
-          { class: 'ai-pad' },
+          { class: 'card' },
+          h('strong', null, 'Get a first-pass review from Claude'),
           h(
-            'div',
-            { class: 'card' },
-            h('strong', null, 'Get a first-pass review from Claude'),
-            h(
-              'p',
-              null,
-              'Claude reads the diff (minus generated files and lockfiles) and lists likely bugs with file and line. You choose which ones become draft comments. Add your Anthropic API key in settings to turn it on.',
-            ),
-            h('button', { class: 'btn primary', onclick: () => send('openOptions') }, 'Add API key'),
+            'p',
+            null,
+            'Claude reads the diff (minus generated files and lockfiles) and lists likely bugs with file and line. You choose which ones become draft comments. Add your Anthropic API key in settings to turn it on, or import findings from your own agent below.',
+          ),
+          h('button', { class: 'btn primary', onclick: () => send('openOptions') }, 'Add API key'),
+        ),
+      );
+    } else {
+      parts.push(
+        h(
+          'div',
+          { class: 'ai-bar' },
+          h('button', { class: 'btn primary', disabled: running || !status, onclick: runAi }, running ? 'Reviewing…' : result ? 'Run again' : 'Run AI review'),
+          h(
+            'span',
+            { class: 'muted small' },
+            running ? `${modelName} is reading the diff. Usually 1–3 minutes.` : `${modelName} · sends the diff to Anthropic with your key`,
           ),
         ),
       );
     }
 
-    const modelName = status?.modelName ?? 'Claude';
-    const parts = [
+    parts.push(
       h(
         'div',
-        { class: 'ai-bar' },
-        h('button', { class: 'btn primary', disabled: running, onclick: runAi }, running ? 'Reviewing…' : result ? 'Run again' : 'Run AI review'),
+        { class: 'import-bar' },
         h(
-          'span',
-          { class: 'muted small' },
-          running ? `${modelName} is reading the diff. Usually 1–3 minutes.` : `${modelName} · sends the diff to Anthropic with your key`,
+          'button',
+          {
+            class: 'btn small quiet',
+            title: 'Paste the answer from Claude Code, Cursor or any chat. "Copy for AI" asks for the right format.',
+            onclick: () => {
+              els.importBox.hidden = !els.importBox.hidden;
+              if (!els.importBox.hidden) els.importInput.focus();
+            },
+          },
+          'Import findings from your own agent',
         ),
       ),
-    ];
+      els.importBox,
+    );
     if (aiError) {
       parts.push(
         h(
@@ -569,14 +747,129 @@
       }
       parts.push(h('div', { class: 'ai-summary' }, h('div', { class: 'muted small' }, `${result.modelName} · ${RC.timeAgo(result.at)}`), result.summary));
       const shown = result.findings.filter((f) => f.state !== 'dismissed');
+      const pending = shown.filter((f) => f.state === 'new').length;
+      if (pending > 1) {
+        parts.push(
+          h(
+            'div',
+            { class: 'import-bar' },
+            h('button', { class: 'btn small', onclick: (e) => postAll(e.currentTarget) }, `Add all ${pending} as draft comments`),
+            h('span', { class: 'muted small' }, 'Nothing is visible until you submit your review.'),
+          ),
+        );
+      }
       if (!shown.length) parts.push(h('div', { class: 'empty' }, result.findings.length ? 'All findings dismissed.' : 'No issues found. 🎉'));
       parts.push(...shown.map(findingCard));
-    } else if (!running && !aiError) {
+    } else if (configured && !running && !aiError) {
       parts.push(
         h(
           'p',
           { class: 'muted ai-pad' },
           'Claude lists likely bugs, security problems and missing tests. Nothing is posted until you choose "Add as draft comment" on a finding and then submit your review on GitHub.',
+        ),
+      );
+    }
+    box.replaceChildren(...parts);
+  }
+
+  function renderCode() {
+    if (!host) return;
+    const box = els.codeResults;
+    if (!data) return box.replaceChildren(h('div', { class: 'empty' }, 'Loading pull request…'));
+    const { viewer } = code;
+
+    if (viewer) {
+      const back = h('button', { class: 'btn small quiet', onclick: () => { code.viewer = null; renderCode(); } }, '← Back');
+      if (viewer.loading) return box.replaceChildren(h('div', { class: 'viewer-hd' }, back, h('span', { class: 'muted small' }, `Opening ${viewer.path}…`)));
+      if (viewer.error) return box.replaceChildren(h('div', { class: 'viewer-hd' }, back), h('div', { class: 'card error' }, h('p', null, viewer.error.message)));
+      const from = Math.max(1, viewer.line - 3);
+      const to = Math.min(viewer.lines.length, viewer.line + 60);
+      const inPr = files.find((f) => f.path === viewer.path && viewer.ref === data.headRefOid);
+      const blobUrl = `https://github.com/${pr.owner}/${pr.repo}/blob/${viewer.ref}/${viewer.path.split('/').map(encodeURIComponent).join('/')}#L${viewer.line}`;
+      return box.replaceChildren(
+        h('div', { class: 'viewer-hd' }, back, h('span', { class: 'viewer-path', title: viewer.path }, `${viewer.path}:${viewer.line}`)),
+        h(
+          'div',
+          { class: 'viewer-actions' },
+          inPr ? h('button', { class: 'btn small', onclick: () => select(inPr, viewer.line) }, 'Show in diff') : null,
+          h('a', { class: 'small', href: blobUrl, target: '_blank', rel: 'noopener' }, 'Open on GitHub ↗'),
+          h('span', { class: 'muted small' }, viewer.ref === data.headRefOid ? 'at this PR' : 'on the default branch'),
+        ),
+        h(
+          'pre',
+          { class: 'code' },
+          viewer.lines.slice(from - 1, to).map((text, i) =>
+            h('div', { class: from + i === viewer.line ? 'hl' : null }, h('span', { class: 'ln' }, from + i), text || ' '),
+          ),
+        ),
+      );
+    }
+
+    const parts = [];
+
+    // Symbol lookup results
+    if (code.searching) parts.push(h('div', { class: 'empty' }, `Looking for ${code.query}…`));
+    if (code.error) parts.push(h('div', { class: 'card error' }, h('p', null, code.error.message)));
+    if (code.results) {
+      const { definitions, references, searchError } = code.results;
+      const row = (item) =>
+        h(
+          'button',
+          { class: 'sym', onclick: () => openViewer(item) },
+          h('span', { class: 'sym-path' }, item.line ? `${item.path}:${item.line}` : item.path, item.inPr ? h('span', { class: 'chip accent' }, 'in this PR') : null),
+          item.preview ? h('code', { class: 'sym-preview' }, item.preview) : null,
+        );
+      parts.push(h('div', { class: 'section-hd' }, `Definitions of ${code.query}`, h('span', null, definitions.length)));
+      parts.push(...(definitions.length ? definitions.map(row) : [h('div', { class: 'empty-sm' }, 'No definition found.')]));
+      if (references.length) {
+        parts.push(h('div', { class: 'section-hd' }, 'Used in', h('span', null, references.length)));
+        parts.push(...references.map(row));
+      }
+      if (searchError) parts.push(h('div', { class: 'empty-sm' }, `GitHub code search unavailable: ${searchError}`));
+    }
+
+    // Changed sections of the current file
+    const f = cursorFile();
+    parts.push(h('div', { class: 'section-hd' }, f ? `Changed sections · ${f.path.slice(f.path.lastIndexOf('/') + 1)}` : 'Changed sections'));
+    if (!f) {
+      parts.push(h('div', { class: 'empty-sm' }, 'Pick a file (Alt+J, or click one in Files) to see which functions it changes.'));
+    } else if (code.outlineFor !== f.path) {
+      if (prefs.tab === 'code') loadOutline(f);
+      parts.push(h('div', { class: 'empty-sm' }, 'Reading the file…'));
+    } else if (code.outlineError) {
+      parts.push(h('div', { class: 'empty-sm' }, code.outlineError.message));
+    } else if (!code.outline) {
+      parts.push(h('div', { class: 'empty-sm' }, 'Reading the file…'));
+    } else {
+      parts.push(
+        ...code.outline.map((hunk) =>
+          h(
+            'div',
+            { class: 'hunk', title: 'Jump to this change', onclick: () => openFile(f, hunk.firstChange) },
+            h('code', { class: 'hunk-fn' }, hunk.fn || '(top level)'),
+            h(
+              'div',
+              { class: 'hunk-meta' },
+              `lines ${hunk.start}–${hunk.end} · `,
+              h('span', { class: 'add' }, `+${hunk.additions}`),
+              ' ',
+              h('span', { class: 'del' }, `−${hunk.deletions}`),
+              hunk.fnLine
+                ? h(
+                    'button',
+                    {
+                      class: 'link',
+                      title: 'Read the whole function here',
+                      onclick: (e) => {
+                        e.stopPropagation();
+                        openViewer({ path: f.path, ref: data.headRefOid, line: hunk.fnLine });
+                      },
+                    },
+                    'view function',
+                  )
+                : null,
+            ),
+          ),
         ),
       );
     }
@@ -694,7 +987,42 @@
 
     els.root = shadow;
     els.summary = h('div', { class: 'summary' });
-    els.tabs = { files: tab('files', 'Files'), threads: tab('threads', 'Conversations'), ai: tab('ai', 'AI review') };
+    els.tabs = { files: tab('files', 'Files'), threads: tab('threads', 'Conversations'), code: tab('code', 'Code'), ai: tab('ai', 'AI review') };
+    els.symbol = h('input', { type: 'search', class: 'search', placeholder: 'Find definition…  (select a name, Alt+G)', spellcheck: 'false' });
+    els.codeResults = h('div');
+    els.codeView = h(
+      'div',
+      { class: 'scroll' },
+      h(
+        'form',
+        {
+          class: 'tools-row code-search',
+          onsubmit: (e) => {
+            e.preventDefault();
+            const symbol = RC.extractIdentifier(els.symbol.value);
+            if (symbol) lookup(symbol);
+          },
+        },
+        els.symbol,
+        h('button', { class: 'btn small', type: 'submit' }, 'Find'),
+      ),
+      els.codeResults,
+    );
+    els.importInput = h('textarea', {
+      class: 'notes-input',
+      placeholder: 'Paste your agent\'s answer. It needs a JSON block like {"findings": [{"path", "line", "severity", "title", "explanation", "suggestion"}]}. "Copy for AI" asks for exactly this.',
+    });
+    els.importBox = h(
+      'div',
+      { class: 'import', hidden: true },
+      els.importInput,
+      h(
+        'div',
+        { class: 'finding-actions' },
+        h('button', { class: 'btn small primary', onclick: importFindings }, 'Import'),
+        h('button', { class: 'btn small quiet', onclick: () => { els.importBox.hidden = true; } }, 'Cancel'),
+      ),
+    );
     els.search = h('input', { type: 'search', class: 'search', placeholder: 'Filter files…  (Alt+/)', spellcheck: 'false' });
     els.sort = h(
       'select',
@@ -727,6 +1055,7 @@
         els.list,
       ),
       threads: h('div', { class: 'view' }, els.threadsList),
+      code: h('div', { class: 'view' }, els.codeView),
       ai: h('div', { class: 'view' }, els.aiView),
     };
     els.notes = h('textarea', { class: 'notes-input', placeholder: 'Private notes for this PR. Saved in your browser only.' });
@@ -764,6 +1093,7 @@
           kbd('Alt'), '+', kbd('J'), '/', kbd('K'), ' move · ',
           kbd('Alt'), '+', kbd('N'), ' next unviewed · ',
           kbd('Alt'), '+', kbd('V'), ' viewed · ',
+          kbd('Alt'), '+', kbd('G'), ' definition · ',
           kbd('Alt'), '+', kbd('R'), ' panel',
         ),
       ),
@@ -851,6 +1181,16 @@
           els.search.focus();
           els.search.select();
         },
+        KeyG: () => {
+          const symbol = RC.extractIdentifier(String(window.getSelection() || ''));
+          setOpen(true);
+          setTab('code');
+          if (symbol) lookup(symbol);
+          else {
+            els.symbol.focus();
+            toast('Select a function or type name in the diff, then press Alt+G.');
+          }
+        },
       };
       const action = actions[e.code];
       if (!action) return;
@@ -882,6 +1222,9 @@
       since = null;
       error = null;
       ai = newAiState();
+      code = newCodeState();
+      diffCache = null;
+      if (host) els.symbol.value = '';
       const target = pr;
       mount().then(() => {
         loadNotes();

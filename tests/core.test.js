@@ -111,6 +111,84 @@ test('annotateDiff numbers new-file lines and leaves removed lines unnumbered', 
   assert.equal(lines[7], '   21 +new');
 });
 
+test('parseHunks returns new-file ranges and the first changed line', () => {
+  const hunks = RC.parseHunks(
+    ['diff --git a/x.go b/x.go', '@@ -342,6 +342,26 @@', ' a', ' b', ' c', '+d', '+e', ' f', '@@ -400 +420 @@ func g() {', '-gone'].join('\n'),
+  );
+  assert.equal(hunks.length, 2);
+  assert.deepEqual(
+    { start: hunks[0].start, end: hunks[0].end, firstChange: hunks[0].firstChange, additions: hunks[0].additions },
+    { start: 342, end: 367, firstChange: 345, additions: 2 },
+  );
+  assert.equal(hunks[1].context, 'func g() {');
+  assert.equal(hunks[1].firstChange, 420);
+  assert.equal(hunks[1].deletions, 1);
+});
+
+test('enclosingFunction answers "what method am I looking at?" (Prometheus relabel.go)', () => {
+  const file = [
+    'package relabel',
+    '',
+    'func relabel(cfg *Config, lb *labels.Builder) (keep bool) {',
+    '\tswitch cfg.Action {',
+    '\tcase LabelMap:',
+    '\t\tre := cfg.Regex.Regexp',
+    '\t\tif prefix, emptySuffix := labelMapWildcardPrefix(re); prefix != "" {',
+    '\t\t\tlb.Range(func(l labels.Label) {',
+    '\t\t\t\tif !strings.HasPrefix(l.Name, prefix) {',
+  ];
+  assert.deepEqual(RC.enclosingFunction(file, 9), {
+    line: 3,
+    text: 'func relabel(cfg *Config, lb *labels.Builder) (keep bool)',
+  });
+  assert.equal(RC.enclosingFunction(['package x', 'import "fmt"'], 2), null);
+
+  const ts = ['export class Cart {', '  total(items: Item[]): number {', '    if (!items.length) {', '      return 0;'];
+  assert.equal(RC.enclosingFunction(ts, 4).text, 'total(items: Item[]): number');
+
+  const py = ['class Repo:', '    async def fetch(self, id):', '        if id is None:', '            raise ValueError()'];
+  assert.equal(RC.enclosingFunction(py, 4).text, 'async def fetch(self, id):');
+});
+
+test('definitionRegex finds definitions, not calls', () => {
+  const re = RC.definitionRegex('labelMapWildcardPrefix');
+  assert.ok(re.test('func labelMapWildcardPrefix(re *regexp.Regexp) (string, bool) {'));
+  assert.ok(!re.test('\tif prefix, emptySuffix := labelMapWildcardPrefix(re); prefix != "" {'));
+  assert.ok(RC.definitionRegex('Process').test('func (r *Relabeler) Process(lset labels.Labels) bool {'));
+  assert.ok(RC.definitionRegex('Cart').test('export class Cart {'));
+  assert.ok(RC.definitionRegex('total').test('  total(items: Item[]) {'));
+  assert.ok(RC.definitionRegex('loadUser').test('export const loadUser = async (id) => {'));
+  assert.ok(RC.definitionRegex('fetch').test('    async def fetch(self, id):'));
+  assert.ok(!RC.definitionRegex('total').test('    return total(items);'));
+});
+
+test('extractIdentifier picks the name you meant from a selection', () => {
+  assert.equal(RC.extractIdentifier('labelMapWildcardPrefix(re)'), 'labelMapWildcardPrefix');
+  assert.equal(RC.extractIdentifier(' cfg.Regex.Regexp '), 'Regexp');
+  assert.equal(RC.extractIdentifier('  '), null);
+});
+
+test('parseFindings imports findings from any agent output', () => {
+  const answer = [
+    'Looks mostly fine. Two issues:',
+    '```json',
+    '{"findings": [',
+    '  {"path": "b/model/relabel/relabel.go", "line": 353, "severity": "high", "title": "Re-runs regex", "explanation": "x", "suggestion": "y"},',
+    '  {"path": "a.go", "line": 0, "title": "bad line is skipped"},',
+    '  {"path": "c.go", "line": "12", "severity": "urgent", "title": "t", "body": "from body"}',
+    ']}',
+    '```',
+  ].join('\n');
+  const findings = RC.parseFindings(answer);
+  assert.equal(findings.length, 2);
+  assert.equal(findings[0].path, 'model/relabel/relabel.go');
+  assert.equal(findings[1].line, 12);
+  assert.equal(findings[1].severity, 'medium');
+  assert.equal(findings[1].explanation, 'from body');
+  assert.deepEqual(RC.parseFindings('[]'), []);
+  assert.throws(() => RC.parseFindings('no json here'), /Couldn't find findings JSON/);
+});
+
 test('parsePullUrl recognizes every PR tab and nothing else', () => {
   assert.deepEqual(RC.parsePullUrl('/octo-org/my.repo/pull/42'), { owner: 'octo-org', repo: 'my.repo', number: 42 });
   assert.deepEqual(RC.parsePullUrl('/a/b/pull/7/files'), { owner: 'a', repo: 'b', number: 7 });
@@ -169,4 +247,6 @@ test('buildAiPrompt includes PR context and a fence the diff cannot escape', () 
   assert.match(prompt, /\(no description\)/);
   assert.match(prompt, /Left out 1 generated\/lock file\(s\): package-lock\.json/);
   assert.match(prompt, /````diff\n/); // diff contains ``` so the fence must be longer
+  assert.match(prompt, /\n {4}1 \+new/); // diff lines carry new-file line numbers
+  assert.match(prompt, /"findings"/); // asks for importable JSON
 });

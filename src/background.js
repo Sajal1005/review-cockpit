@@ -340,6 +340,70 @@ async function aiReview({ owner, repo, number, title, body, url, author }) {
 }
 
 // ---------------------------------------------------------------------------
+// Code exploration: read files at a commit, find where a symbol is defined
+// ---------------------------------------------------------------------------
+
+const fileCache = new Map(); // "owner/repo@ref:path" -> text; files at a commit never change
+
+async function getFile({ owner, repo, ref, path }) {
+  const key = `${owner}/${repo}@${ref}:${path}`;
+  if (fileCache.has(key)) return fileCache.get(key);
+  const res = await request(
+    `/repos/${enc(owner)}/${enc(repo)}/contents/${path.split('/').map(enc).join('/')}?ref=${enc(ref)}`,
+    { accept: 'application/vnd.github.raw+json' },
+  );
+  const text = await res.text();
+  if (fileCache.size >= 200) fileCache.clear();
+  fileCache.set(key, text);
+  return text;
+}
+
+// Looks in the PR's own files first (new code isn't in GitHub's search index yet),
+// then GitHub code search over the default branch.
+async function findSymbol({ owner, repo, symbol, head, paths = [] }) {
+  if (!/^[A-Za-z_$][\w$]*$/.test(symbol)) {
+    throw new ApiError('Select a single name, like a function or type.', 'BAD_INPUT');
+  }
+  const isDefinition = RC.definitionRegex(symbol);
+  const definitions = [];
+
+  await Promise.all(
+    paths.slice(0, 40).map(async (path) => {
+      try {
+        const lines = (await getFile({ owner, repo, ref: head, path })).split('\n');
+        lines.forEach((text, i) => {
+          if (isDefinition.test(text)) definitions.push({ path, ref: head, line: i + 1, preview: text.trim(), inPr: true });
+        });
+      } catch {} // binary or oversized files
+    }),
+  );
+
+  const references = [];
+  let searchError = null;
+  try {
+    const res = await request(`/search/code?q=${enc(`${symbol} repo:${owner}/${repo}`)}&per_page=30`, {
+      accept: 'application/vnd.github.text-match+json',
+    });
+    for (const item of (await res.json()).items || []) {
+      const ref = new URL(item.url).searchParams.get('ref');
+      const lines = (item.text_matches || []).flatMap((m) => m.fragment.split('\n'));
+      const definitionLine = lines.find((l) => isDefinition.test(l));
+      if (definitionLine) {
+        if (!definitions.some((d) => d.path === item.path)) {
+          definitions.push({ path: item.path, ref, line: null, preview: definitionLine.trim(), inPr: false });
+        }
+      } else {
+        references.push({ path: item.path, ref, line: null, preview: (lines.find((l) => l.includes(symbol)) || '').trim() });
+      }
+    }
+  } catch (err) {
+    searchError = err.message;
+  }
+
+  return { definitions, references: references.slice(0, 15), searchError };
+}
+
+// ---------------------------------------------------------------------------
 // Review queue for the toolbar popup + badge
 // ---------------------------------------------------------------------------
 
@@ -433,6 +497,8 @@ const handlers = {
   getQueue,
   validateToken,
   addDraftComment,
+  getFile,
+  findSymbol,
   aiStatus,
   aiReview,
   openOptions: () => chrome.runtime.openOptionsPage(),

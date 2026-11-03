@@ -129,6 +129,124 @@
       .join('\n');
   }
 
+  // One file's diff -> its hunks, with new-file line ranges and the first changed line.
+  function parseHunks(fileDiff) {
+    const hunks = [];
+    let hunk = null;
+    let line = 0;
+    for (const text of fileDiff.split('\n')) {
+      const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(text);
+      if (m) {
+        line = Number(m[1]);
+        const count = m[2] === undefined ? 1 : Number(m[2]);
+        hunk = { start: line, end: Math.max(line, line + count - 1), context: m[3].trim(), additions: 0, deletions: 0, firstChange: null };
+        hunks.push(hunk);
+      } else if (!hunk) {
+        continue;
+      } else if (text.startsWith('+')) {
+        hunk.additions++;
+        hunk.firstChange ??= line;
+        line++;
+      } else if (text.startsWith('-')) {
+        hunk.deletions++;
+        hunk.firstChange ??= line;
+      } else if (text.startsWith(' ')) {
+        line++;
+      }
+    }
+    for (const h of hunks) h.firstChange ??= h.start;
+    return hunks;
+  }
+
+  // Lines that open a function, method or type in common languages. Heuristic by design:
+  // good enough to answer "what am I looking at?" without a parser per language.
+  const FUNCTION_LINE = new RegExp(
+    [
+      /^\s*func\s+(\([^)]*\)\s*)?\w+/, // Go
+      /^\s*(export\s+)?(default\s+)?(async\s+)?function\b/, // JS/TS/PHP
+      /^\s*(export\s+)?((const|let|var)\s+)?\w+\s*=\s*(async\s+)?(\([^)]*\)|\w+)\s*=>/, // arrow functions
+      /^\s*(async\s+)?def\s+\w+/, // Python/Ruby
+      /^\s*(pub(\([^)]*\))?\s+)?(async\s+)?(unsafe\s+)?fn\s+\w+/, // Rust
+      /^\s*((public|private|protected|internal|static|final|override|virtual|abstract|async|synchronized|suspend|open)\s+)+[\w<>[\],.?\s]*\w+\s*\(/, // Java/C#/Kotlin/Swift
+      /^\s*(fun|func)\s+\w+/, // Kotlin/Swift
+      /^\s*(export\s+)?(abstract\s+)?(class|interface|struct|trait|impl|enum|module|object)\b/, // types
+      /^\s*(async\s+)?(static\s+)?(get\s+|set\s+)?(?!(if|for|while|switch|catch|return|else)\b)\w+\s*\([^)]*\)\s*(:\s*[^{=;]+)?\{\s*$/, // method shorthand
+    ]
+      .map((re) => re.source)
+      .join('|'),
+  );
+
+  // Nearest function/type opening at or above `lineNo` (1-based). Returns { line, text } or null.
+  function enclosingFunction(lines, lineNo) {
+    for (let i = Math.min(lineNo, lines.length) - 1; i >= 0; i--) {
+      if (FUNCTION_LINE.test(lines[i])) return { line: i + 1, text: lines[i].trim().replace(/\s*\{\s*$/, '').slice(0, 140) };
+    }
+    return null;
+  }
+
+  function escapeRegExp(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  // Matches a line that *defines* `symbol` (as opposed to using it).
+  function definitionRegex(symbol) {
+    const s = escapeRegExp(symbol);
+    return new RegExp(
+      [
+        `^\\s*func\\s+(\\([^)]*\\)\\s*)?${s}\\b`,
+        `\\bfunction\\*?\\s+${s}\\b`,
+        `^\\s*(export\\s+)?(const|let|var)\\s+${s}\\s*[:=]`,
+        `^\\s*(export\\s+)?(default\\s+)?(abstract\\s+|sealed\\s+|data\\s+)?(class|interface|type|enum|struct|trait|object|record|protocol|module)\\s+${s}\\b`,
+        `^\\s*(async\\s+)?def\\s+${s}\\b`,
+        `^\\s*(pub(\\([^)]*\\))?\\s+)?(async\\s+)?(unsafe\\s+)?fn\\s+${s}\\b`,
+        `^\\s*((public|private|protected|internal|static|final|override|virtual|abstract|async|synchronized|suspend|open)\\s+)+[\\w<>[\\],.?\\s]*\\b${s}\\s*\\(`,
+        `^\\s*(fun|func)\\s+(<[^>]*>\\s*)?(\\w+\\.)?${s}\\b`,
+        `^\\s*(async\\s+)?(static\\s+)?(get\\s+|set\\s+)?${s}\\s*\\([^)]*\\)\\s*(:\\s*[^{=;]+)?\\{\\s*$`,
+      ].join('|'),
+    );
+  }
+
+  // Picks the identifier someone most likely meant from a text selection like
+  // "labelMapWildcardPrefix(re)" or "cfg.Regex.Regexp".
+  function extractIdentifier(selection) {
+    const text = String(selection || '').trim();
+    const call = /([A-Za-z_$][\w$]*)\s*\(/.exec(text);
+    if (call) return call[1];
+    const ids = text.match(/[A-Za-z_$][\w$]*/g);
+    return ids ? ids[ids.length - 1] : null;
+  }
+
+  const FINDINGS_FORMAT =
+    '{"findings": [{"path": "src/file.ts", "line": 42, "severity": "high|medium|low", "title": "...", "explanation": "...", "suggestion": "..."}]}';
+
+  // Pulls review findings out of any AI agent's answer: a ```json block or bare JSON,
+  // either {"findings": [...]} or a plain array.
+  function parseFindings(text) {
+    const candidates = [...String(text).matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)].map((m) => m[1]).reverse();
+    candidates.push(String(text));
+    for (const candidate of candidates) {
+      let parsed;
+      try {
+        parsed = JSON.parse(candidate.trim());
+      } catch {
+        continue;
+      }
+      const list = Array.isArray(parsed) ? parsed : parsed?.findings;
+      if (!Array.isArray(list)) continue;
+      return list
+        .filter((f) => f && typeof f.path === 'string' && Number.isInteger(Number(f.line)) && Number(f.line) > 0)
+        .map((f) => ({
+          path: f.path.replace(/^[ab]\//, ''),
+          line: Number(f.line),
+          severity: ['high', 'medium', 'low'].includes(f.severity) ? f.severity : 'medium',
+          title: String(f.title || 'Finding'),
+          explanation: String(f.explanation ?? f.body ?? f.description ?? ''),
+          suggestion: String(f.suggestion ?? ''),
+        }));
+    }
+    throw new Error(`Couldn't find findings JSON. Expected: ${FINDINGS_FORMAT}`);
+  }
+
   // "/owner/repo/pull/123/files" -> { owner, repo, number }
   function parsePullUrl(pathname) {
     const m = /^\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)(?:\/|$)/.exec(pathname);
@@ -172,12 +290,14 @@
   }
 
   function buildAiPrompt({ title, url, author, headRefName, baseRefName, body, diff, removed = [] }) {
-    const fence = fenceFor(diff);
+    const annotated = annotateDiff(diff);
+    const fence = fenceFor(annotated);
     return [
       'Please review this GitHub pull request like a senior engineer.',
       'Focus on correctness bugs, security problems, unhandled edge cases, performance or concurrency issues, and missing tests.',
-      'Skip style nits and anything a linter would catch. For each finding, cite the file and line, describe the concrete failure scenario, and suggest a fix.',
-      'If the change looks good, say so briefly.',
+      'Skip style nits and anything a linter would catch. For each finding, describe the concrete failure scenario and suggest a fix.',
+      'Every added or unchanged diff line is prefixed with its line number in the new file; use those numbers.',
+      `End your answer with one \`\`\`json code block in exactly this shape (an empty list if the change looks good): ${FINDINGS_FORMAT}`,
       '',
       `# ${title}`,
       url,
@@ -189,7 +309,7 @@
       '## Diff',
       removed.length ? `(Left out ${removed.length} generated/lock file(s): ${removed.join(', ')})` : null,
       `${fence}diff`,
-      diff.replace(/\n+$/, ''),
+      annotated.replace(/\n+$/, ''),
       fence,
       '',
     ]
@@ -206,6 +326,11 @@
     sortByRisk,
     estimateMinutes,
     annotateDiff,
+    parseHunks,
+    enclosingFunction,
+    definitionRegex,
+    extractIdentifier,
+    parseFindings,
     parsePullUrl,
     splitDiff,
     stripNoise,
