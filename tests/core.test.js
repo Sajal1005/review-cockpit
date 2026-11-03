@@ -49,6 +49,68 @@ test('sortFiles orders by category, then path', () => {
   );
 });
 
+function withCategory(files) {
+  return files.map((f) => ({ changeType: 'MODIFIED', additions: 10, deletions: 0, ...f, category: RC.classify(f.path) }));
+}
+
+test('assessRisk puts security-sensitive source above everything else', () => {
+  const files = withCategory([
+    { path: 'src/auth/session.ts', additions: 40 },
+    { path: 'src/ui/button.tsx', additions: 5 },
+    { path: 'docs/auth.md', additions: 200 },
+    { path: 'package-lock.json', additions: 5000 },
+  ]);
+  const risk = RC.assessRisk(files);
+  assert.equal(risk.get('src/auth/session.ts').level, 'high');
+  assert.ok(risk.get('src/auth/session.ts').reasons.includes('security'));
+  assert.equal(risk.get('src/ui/button.tsx').level, 'low');
+  assert.equal(risk.get('docs/auth.md').level, 'low'); // docs never get path-based risk
+  assert.equal(risk.get('package-lock.json').score, 0); // noise is never "large"
+});
+
+test('assessRisk flags new logic that ships without tests, unless a matching test is in the PR', () => {
+  const untested = RC.assessRisk(withCategory([{ path: 'src/pricing_rules.py', additions: 80 }]));
+  assert.ok(untested.get('src/pricing_rules.py').reasons.includes('no tests in PR'));
+
+  const tested = RC.assessRisk(withCategory([
+    { path: 'src/pricing_rules.py', additions: 80 },
+    { path: 'tests/test_pricing_rules.py', additions: 30 },
+  ]));
+  assert.ok(!tested.get('src/pricing_rules.py').reasons.includes('no tests in PR'));
+});
+
+test('sortByRisk orders by score, then path', () => {
+  const files = withCategory([{ path: 'b.ts' }, { path: 'src/payments/charge.ts' }, { path: 'a.ts' }]);
+  const risk = RC.assessRisk(files);
+  const sorted = RC.sortByRisk(files.map((f) => ({ ...f, risk: risk.get(f.path) })));
+  assert.deepEqual(sorted.map((f) => f.path), ['src/payments/charge.ts', 'a.ts', 'b.ts']);
+});
+
+test('estimateMinutes assumes ~300 lines per hour', () => {
+  assert.equal(RC.estimateMinutes(0), 0);
+  assert.equal(RC.estimateMinutes(2), 1);
+  assert.equal(RC.estimateMinutes(300), 60);
+});
+
+test('annotateDiff numbers new-file lines and leaves removed lines unnumbered', () => {
+  const diff = [
+    'diff --git a/x.js b/x.js',
+    '--- a/x.js',
+    '+++ b/x.js',
+    '@@ -10,3 +20,3 @@ function f() {',
+    ' keep',
+    '-old',
+    '--- a removed line that looks like a header',
+    '+new',
+  ].join('\n');
+  const lines = RC.annotateDiff(diff).split('\n');
+  assert.equal(lines[1], '--- a/x.js'); // headers before the hunk are untouched
+  assert.equal(lines[4], '   20  keep');
+  assert.equal(lines[5], '      -old');
+  assert.equal(lines[6], '      --- a removed line that looks like a header');
+  assert.equal(lines[7], '   21 +new');
+});
+
 test('parsePullUrl recognizes every PR tab and nothing else', () => {
   assert.deepEqual(RC.parsePullUrl('/octo-org/my.repo/pull/42'), { owner: 'octo-org', repo: 'my.repo', number: 42 });
   assert.deepEqual(RC.parsePullUrl('/a/b/pull/7/files'), { owner: 'a', repo: 'b', number: 7 });

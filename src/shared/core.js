@@ -43,6 +43,92 @@
     );
   }
 
+  // Path patterns that make a change riskier to get wrong. Only applied to source and config files,
+  // so docs/auth.md or tests/test_login.py don't count.
+  const RISK_RULES = [
+    ['security', 3, /(auth|login|logout|session|token|passw|secret|crypt|permission|rbac|acl|oauth|jwt|csrf|cors|sanitiz|security|credential)/i],
+    ['migration', 3, /((^|\/)migrations?\/|\.sql$|(^|\/)schema\.(prisma|rb|graphql)$|alembic|flyway|liquibase)/i],
+    ['payments', 3, /(payment|billing|invoice|checkout|stripe|paypal|refund|pricing)/i],
+    ['public API', 2, /((^|\/)(api|routes?|controllers?|handlers?|endpoints?)\/|openapi|swagger|\.proto$|\.graphql$)/i],
+    ['deploy', 2, /((^|\/)\.github\/workflows\/|(^|\/)(terraform|k8s|kubernetes|helm|charts|deploy|infra)\/|Dockerfile|\.tf$)/i],
+  ];
+  const BASE_RISK = { source: 2, config: 1, test: 0.5, docs: 0, generated: 0, lockfile: 0 };
+  const GENERIC_STEMS = new Set(['index', 'main', 'mod', 'lib', 'app', '__init__', 'utils', 'types']);
+
+  function stem(path) {
+    return path.slice(path.lastIndexOf('/') + 1).split('.')[0].toLowerCase();
+  }
+
+  // Scores every file so reviewers can start where mistakes are most expensive.
+  // Returns Map<path, { score, level: 'high' | 'medium' | 'low', reasons: string[] }>.
+  function assessRisk(files) {
+    const testNames = files.filter((f) => f.category === 'test').map((f) => f.path.slice(f.path.lastIndexOf('/') + 1).toLowerCase());
+    const result = new Map();
+    for (const f of files) {
+      let score = BASE_RISK[f.category] ?? 1;
+      const reasons = [];
+      if (f.category === 'source' || f.category === 'config') {
+        for (const [reason, weight, re] of RISK_RULES) {
+          if (re.test(f.path)) {
+            score += weight;
+            reasons.push(reason);
+          }
+        }
+      }
+      const churn = (f.additions || 0) + (f.deletions || 0);
+      if (!isNoise(f.category) && churn >= 300) {
+        score += 2;
+        reasons.push('large change');
+      } else if (!isNoise(f.category) && churn >= 100) {
+        score += 1;
+      }
+      const s = stem(f.path);
+      if (f.category === 'source' && f.changeType !== 'DELETED' && (f.additions || 0) >= 20 && !GENERIC_STEMS.has(s) && !testNames.some((t) => t.includes(s))) {
+        score += 1;
+        reasons.push('no tests in PR');
+      }
+      if (f.changeType === 'DELETED') score = Math.max(0, score - 1);
+      result.set(f.path, { score, level: score >= 5 ? 'high' : score >= 3 ? 'medium' : 'low', reasons });
+    }
+    return result;
+  }
+
+  // Highest risk first; files need a .risk from assessRisk().
+  function sortByRisk(files) {
+    return [...files].sort((a, b) => b.risk.score - a.risk.score || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  }
+
+  // Rough reading time at ~300 reviewed lines per hour, the commonly cited sustainable pace.
+  function estimateMinutes(lines) {
+    return lines ? Math.max(1, Math.round(lines / 5)) : 0;
+  }
+
+  // Prefixes every added/context line with its line number in the new file, so an AI reviewer
+  // can cite lines GitHub will accept for review comments.
+  function annotateDiff(diff) {
+    let inHunk = false;
+    let line = 0;
+    return diff
+      .split('\n')
+      .map((text) => {
+        if (text.startsWith('diff --git ')) {
+          inHunk = false;
+          return text;
+        }
+        const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
+        if (hunk) {
+          inHunk = true;
+          line = Number(hunk[1]);
+          return text;
+        }
+        if (!inHunk) return text;
+        if (text.startsWith('+') || text.startsWith(' ')) return `${String(line++).padStart(5)} ${text}`;
+        if (text.startsWith('-')) return `      ${text}`;
+        return text;
+      })
+      .join('\n');
+  }
+
   // "/owner/repo/pull/123/files" -> { owner, repo, number }
   function parsePullUrl(pathname) {
     const m = /^\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)(?:\/|$)/.exec(pathname);
@@ -111,7 +197,20 @@
       .join('\n');
   }
 
-  const api = { CATEGORIES, classify, isNoise, sortFiles, parsePullUrl, splitDiff, stripNoise, buildAiPrompt };
+  const api = {
+    CATEGORIES,
+    classify,
+    isNoise,
+    sortFiles,
+    assessRisk,
+    sortByRisk,
+    estimateMinutes,
+    annotateDiff,
+    parsePullUrl,
+    splitDiff,
+    stripNoise,
+    buildAiPrompt,
+  };
 
   root.ReviewCockpit = Object.assign(root.ReviewCockpit || {}, api);
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

@@ -1,6 +1,6 @@
 {
   "name": "review-cockpit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "A faster, keyboard-first pull request review experience layered on top of GitHub.",
   "license": "MIT",

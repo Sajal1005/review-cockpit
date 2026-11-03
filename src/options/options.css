@@ -26,6 +26,14 @@ body { background: var(--bg-muted); }
   outline: none;
 }
 .token-row input:focus { border-color: var(--accent); }
+.select {
+  padding: 5px 8px;
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
 
 .status { min-height: 20px; margin: 8px 0; font-size: 12px; }
 .status.ok { color: var(--success); }

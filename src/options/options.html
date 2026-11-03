@@ -59,6 +59,30 @@
       </section>
 
       <section class="card">
+        <h2>3. AI review (optional)</h2>
+        <p>
+          The <em>AI review</em> tab asks Claude for a first-pass review and lists likely bugs with file and line.
+          You decide which findings become draft comments, and nothing is posted until you submit your review on GitHub.
+        </p>
+        <p class="muted small">
+          When you click <em>Run AI review</em>, the PR's title, description and diff (minus generated files and lockfiles)
+          are sent to Anthropic's API using your key. Get a key at
+          <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.
+          It's stored only in this browser.
+        </p>
+        <form id="ai-form" class="token-row">
+          <input id="ai-key" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" />
+          <select id="ai-model" class="select">
+            <option value="claude-opus-5-5">Claude Opus 5.5 (best)</option>
+            <option value="claude-sonnet-5-5">Claude Sonnet 5.5 (faster, cheaper)</option>
+          </select>
+          <button class="btn primary" type="submit">Save</button>
+        </form>
+        <div id="ai-status" class="status" role="status"></div>
+        <button class="btn danger" id="ai-remove" type="button" hidden>Remove API key</button>
+      </section>
+
+      <section class="card">
         <h2>Preferences</h2>
         <label class="pref">
           <input type="checkbox" id="autoAdvance" />

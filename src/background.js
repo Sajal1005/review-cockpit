@@ -3,6 +3,9 @@
  * The only place that talks to api.github.com; the token never leaves this worker except in
  * requests to GitHub.
  */
+importScripts('shared/core.js');
+const RC = self.ReviewCockpit;
+
 const API = 'https://api.github.com';
 const QUEUE_ALARM = 'refresh-queue';
 const SHA = /^[0-9a-f]{7,40}$/i;
@@ -76,6 +79,13 @@ const PR_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
       headRefName baseRefName headRefOid
       author { login }
       reviews(last: 100) { nodes { author { login } state submittedAt commit { oid } } }
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved isOutdated path line originalLine
+          first: comments(first: 1) { totalCount nodes { author { login } bodyText url } }
+          last: comments(last: 1) { nodes { author { login } } }
+        }
+      }
       files(first: 100) { ${FILES} }
     }
   }
@@ -127,8 +137,51 @@ async function getPullRequest({ owner, repo, number }) {
     lastReview: lastReview
       ? { oid: lastReview.commit.oid, submittedAt: lastReview.submittedAt, state: lastReview.state }
       : null,
+    threads: pr.reviewThreads.nodes
+      .filter((t) => !t.isResolved)
+      .map((t) => {
+        const first = t.first.nodes[0];
+        return {
+          path: t.path,
+          line: t.line ?? t.originalLine,
+          outdated: t.isOutdated,
+          author: first?.author?.login ?? 'ghost',
+          body: (first?.bodyText ?? '').slice(0, 280),
+          url: first?.url ?? null,
+          replies: Math.max(0, t.first.totalCount - 1),
+          lastAuthor: t.last.nodes[0]?.author?.login ?? null,
+        };
+      }),
     files,
   };
+}
+
+// Adds a comment to your pending (unsubmitted) review, creating one if needed. Nothing is
+// visible to others until you press "Finish your review" on GitHub.
+const PENDING_REVIEW = `query($id: ID!) {
+  node(id: $id) { ... on PullRequest { reviews(states: PENDING, first: 5) { nodes { id viewerDidAuthor } } } }
+}`;
+const START_REVIEW = `mutation($id: ID!) {
+  addPullRequestReview(input: { pullRequestId: $id }) { pullRequestReview { id } }
+}`;
+const ADD_THREAD = `mutation($review: ID!, $path: String!, $line: Int!, $body: String!) {
+  addPullRequestReviewThread(input: { pullRequestReviewId: $review, path: $path, line: $line, side: RIGHT, body: $body }) {
+    thread { id }
+  }
+}`;
+
+async function addDraftComment({ pullRequestId, path, line, body }) {
+  const pending = (await graphql(PENDING_REVIEW, { id: pullRequestId })).node.reviews.nodes.find((r) => r.viewerDidAuthor);
+  const reviewId = pending?.id ?? (await graphql(START_REVIEW, { id: pullRequestId })).addPullRequestReview.pullRequestReview.id;
+  let result;
+  try {
+    result = await graphql(ADD_THREAD, { review: reviewId, path, line: Number(line), body });
+  } catch (err) {
+    throw new ApiError(`GitHub couldn't attach a comment to ${path}:${line} (it may be outside the diff). ${err.message}`, 'BAD_LINE');
+  }
+  if (!result.addPullRequestReviewThread?.thread) {
+    throw new ApiError(`GitHub couldn't attach a comment to ${path}:${line}; that line may be outside the diff.`, 'BAD_LINE');
+  }
 }
 
 const MARK_VIEWED = `mutation($id: ID!, $path: String!) {
@@ -160,6 +213,130 @@ async function getDiff({ owner, repo, number }) {
     accept: 'application/vnd.github.diff',
   });
   return res.text();
+}
+
+// ---------------------------------------------------------------------------
+// AI review (Claude, with the user's own Anthropic API key)
+// ---------------------------------------------------------------------------
+
+// Plain fetch rather than the Anthropic SDK: the extension deliberately has no build step.
+const ANTHROPIC_API = 'https://api.anthropic.com/v1/messages';
+const AI_MODELS = { 'claude-opus-5-5': 'Claude Opus 5.5', 'claude-sonnet-5-5': 'Claude Sonnet 5.5' };
+const DEFAULT_AI_MODEL = 'claude-opus-5-5';
+
+const REVIEW_SYSTEM = `You are a senior engineer reviewing a GitHub pull request. Find real problems: correctness bugs, security issues, unhandled edge cases, data loss, race conditions, performance traps, and missing tests for risky logic. Skip style, naming, formatting, and anything a linter would catch. Only report a finding when you can name the concrete input or state that triggers it. A few high-confidence findings beat many speculative ones, and an empty list is a fine answer for a clean change.
+
+Every added or unchanged line in the diff is prefixed with its line number in the new version of the file. For each finding, set "path" to the file path exactly as it appears in the diff, and "line" to one of those new-file line numbers, preferring a line that was added. Write "explanation" and "suggestion" as short GitHub-flavored markdown suitable for a review comment. Write "summary" as two or three sentences on what the change does and its overall risk.`;
+
+const REVIEW_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          line: { type: 'integer' },
+          severity: { type: 'string', enum: ['high', 'medium', 'low'] },
+          title: { type: 'string' },
+          explanation: { type: 'string' },
+          suggestion: { type: 'string' },
+        },
+        required: ['path', 'line', 'severity', 'title', 'explanation', 'suggestion'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['summary', 'findings'],
+  additionalProperties: false,
+};
+
+async function getAiSettings() {
+  const { anthropicKey, aiModel } = await chrome.storage.local.get(['anthropicKey', 'aiModel']);
+  const model = AI_MODELS[aiModel] ? aiModel : DEFAULT_AI_MODEL;
+  return { key: anthropicKey || null, model, modelName: AI_MODELS[model] };
+}
+
+async function aiStatus() {
+  const { key, model, modelName } = await getAiSettings();
+  return { configured: !!key, model, modelName };
+}
+
+// A review can take a couple of minutes; calling an extension API periodically keeps the
+// service worker from being shut down as idle while the request is in flight.
+async function keepAlive(promise) {
+  const timer = setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20_000);
+  try {
+    return await promise;
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+async function callClaude({ key, model, user }) {
+  const res = await fetch(ANTHROPIC_API, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': key,
+      'anthropic-version': '2026-10-21',
+      // On a safety decline, let the API re-run the request on Anthropic's recommended fallback model.
+      'anthropic-beta': 'server-side-fallback-2026-07-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 16000,
+      fallbacks: 'default',
+      system: REVIEW_SYSTEM,
+      output_config: { effort: 'high', format: { type: 'json_schema', schema: REVIEW_SCHEMA } },
+      messages: [{ role: 'user', content: user }],
+    }),
+  });
+
+  if (!res.ok) {
+    let message = `Anthropic API error ${res.status}`;
+    try {
+      message = (await res.json()).error?.message || message;
+    } catch {}
+    if (res.status === 401) throw new ApiError('Anthropic rejected your API key. Check it in settings.', 'BAD_AI_KEY', 401);
+    if (res.status === 429) message = `Anthropic rate limit reached. ${message}`;
+    if (res.status === 529) message = 'Anthropic is overloaded right now. Try again in a minute.';
+    throw new ApiError(message, 'AI_HTTP', res.status);
+  }
+
+  const message = await res.json();
+  if (message.stop_reason === 'refusal') throw new ApiError('Claude declined to review this diff.', 'AI_REFUSAL');
+  if (message.stop_reason === 'max_tokens') throw new ApiError('The review was cut off before it finished. Try again.', 'AI_TRUNCATED');
+  const text = message.content.find((block) => block.type === 'text')?.text;
+  if (!text) throw new ApiError('Claude returned an empty review.', 'AI_EMPTY');
+  return { ...JSON.parse(text), servedBy: message.model };
+}
+
+async function aiReview({ owner, repo, number, title, body, url, author }) {
+  const { key, model, modelName } = await getAiSettings();
+  if (!key) throw new ApiError('Add an Anthropic API key in settings to use AI review.', 'NO_AI_KEY');
+
+  const { diff, removed } = RC.stripNoise(await getDiff({ owner, repo, number }));
+  if (!diff.trim()) throw new ApiError('Nothing to review: this PR only changes generated files or lockfiles.', 'AI_EMPTY_DIFF');
+
+  const user = [
+    `# ${title}`,
+    url,
+    `Author: @${author}`,
+    '',
+    '## Description',
+    (body || '').trim() || '(no description)',
+    '',
+    removed.length ? `(Generated files and lockfiles left out: ${removed.join(', ')})\n` : '',
+    '## Diff',
+    RC.annotateDiff(diff),
+  ].join('\n');
+
+  const result = await keepAlive(callClaude({ key, model, user }));
+  return { ...result, model, modelName, removed };
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +432,9 @@ const handlers = {
   getDiff,
   getQueue,
   validateToken,
+  addDraftComment,
+  aiStatus,
+  aiReview,
   openOptions: () => chrome.runtime.openOptionsPage(),
 };
 

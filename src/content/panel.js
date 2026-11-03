@@ -13,14 +13,27 @@
   const { h, send } = RC;
 
   const CHANGE_LETTER = { ADDED: 'A', DELETED: 'D', MODIFIED: 'M', RENAMED: 'R', COPIED: 'C', CHANGED: 'M' };
+  const SEVERITY_ORDER = { high: 0, medium: 1, low: 2 };
+  const GROUPINGS = {
+    risk: {
+      key: (f) => f.risk.level,
+      groups: [
+        { id: 'high', label: 'High risk: start here' },
+        { id: 'medium', label: 'Medium risk' },
+        { id: 'low', label: 'Low risk' },
+      ],
+    },
+    type: { key: (f) => f.category, groups: RC.CATEGORIES },
+  };
 
-  const prefs = { open: true, hideNoise: true, unviewedOnly: false, autoAdvance: true };
+  const prefs = { open: true, hideNoise: true, unviewedOnly: false, autoAdvance: true, sort: 'risk', tab: 'files' };
 
   let pr = null; // { owner, repo, number, key } for the PR on screen
   let data = null; // payload from the background worker
-  let files = []; // sorted + enriched with category / anchor
+  let files = []; // sorted + enriched with category / anchor / risk
   let cursorPath = null; // file the keyboard cursor is on
   let since = null; // { from, to, at, paths: Set | null } when there are commits after your last review
+  let ai = newAiState();
   let error = null;
   let fetchedAt = 0;
   let query = '';
@@ -28,6 +41,10 @@
   let host = null;
   let buildPromise = null;
   const els = {};
+
+  function newAiState() {
+    return { status: null, running: false, result: null, error: null };
+  }
 
   // -------------------------------------------------------------------------
   // Data
@@ -53,6 +70,8 @@
         }),
       );
       if (pr !== target) return;
+      const risk = RC.assessRisk(enriched);
+      for (const f of enriched) f.risk = risk.get(f.path);
       data = d;
       files = RC.sortFiles(enriched);
       fetchedAt = Date.now();
@@ -80,45 +99,68 @@
       .catch(() => {}); // e.g. the reviewed commit was force-pushed away; the banner still works
   }
 
+  async function loadAi(target) {
+    const key = `ai:${target.key}`;
+    const state = ai;
+    const [stored, status] = await Promise.all([
+      chrome.storage.local.get(key).then((r) => r[key] || null),
+      send('aiStatus').catch(() => null),
+    ]);
+    if (ai !== state) return;
+    state.result = stored;
+    state.status = status;
+    renderAi();
+    renderTabs();
+  }
+
+  function saveAi(key, result) {
+    chrome.storage.local.set({ [`ai:${key}`]: result }).catch(() => {});
+  }
+
   function isChanged(f) {
     return f.viewedState === 'DISMISSED' || !!since?.paths?.has(f.path);
   }
 
+  // Files in the order they're displayed, which is also the Alt+J/K order.
   function visibleFiles() {
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    return files.filter(
+    const list = files.filter(
       (f) =>
         !(prefs.hideNoise && f.noise) &&
         !(prefs.unviewedOnly && f.viewedState === 'VIEWED') &&
         terms.every((t) => f.path.toLowerCase().includes(t)),
     );
+    return prefs.sort === 'risk' ? RC.sortByRisk(list) : list;
   }
 
   // -------------------------------------------------------------------------
   // Actions
   // -------------------------------------------------------------------------
 
-  function openFile(f) {
+  function openFile(f, line) {
+    // GitHub anchors a right-side diff line as #diff-<sha256(path)>R<line>.
+    const anchor = line ? `${f.anchor}R${line}` : f.anchor;
     if (!/\/pull\/\d+\/(files|changes)\b/.test(location.pathname)) {
-      location.assign(`/${pr.owner}/${pr.repo}/pull/${pr.number}/files#${f.anchor}`);
+      location.assign(`/${pr.owner}/${pr.repo}/pull/${pr.number}/files#${anchor}`);
       return;
     }
     const el =
+      document.getElementById(anchor) ||
       document.getElementById(f.anchor) ||
       document.querySelector(`[data-tagsearch-path="${CSS.escape(f.path)}"]`);
     if (el) {
       el.style.scrollMarginTop = '96px'; // clear GitHub's sticky header
-      el.scrollIntoView({ block: 'start' });
-      history.replaceState(history.state, '', `#${f.anchor}`);
+      el.scrollIntoView({ block: line ? 'center' : 'start' });
+      history.replaceState(history.state, '', `#${anchor}`);
     } else {
-      location.hash = f.anchor; // let GitHub lazy-load and scroll to it
+      location.hash = anchor; // let GitHub lazy-load and scroll to it
     }
   }
 
-  function select(f) {
+  function select(f, line) {
     cursorPath = f.path;
     renderList();
-    openFile(f);
+    openFile(f, line);
     if (!prefs.open) toast(f.path);
   }
 
@@ -184,6 +226,85 @@
     }
   }
 
+  async function runAi() {
+    if (!data || ai.running) return;
+    const state = ai;
+    const target = pr;
+    state.running = true;
+    state.error = null;
+    renderAi();
+    renderTabs();
+    try {
+      const r = await send('aiReview', {
+        owner: target.owner,
+        repo: target.repo,
+        number: target.number,
+        title: data.title,
+        body: data.body,
+        url: data.url,
+        author: data.author,
+      });
+      state.result = {
+        headRefOid: data.headRefOid,
+        at: new Date().toISOString(),
+        modelName: r.modelName,
+        summary: r.summary,
+        removed: r.removed,
+        findings: r.findings
+          .map((f) => ({ ...f, state: 'new' }))
+          .sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]),
+      };
+      saveAi(target.key, state.result);
+    } catch (err) {
+      state.error = err;
+    } finally {
+      state.running = false;
+      if (ai === state) {
+        renderAi();
+        renderTabs();
+      }
+    }
+  }
+
+  async function postFinding(finding, btn) {
+    const state = ai;
+    const key = pr.key;
+    btn.disabled = true;
+    btn.textContent = 'Adding…';
+    const body = `**${finding.title}**\n\n${finding.explanation}${finding.suggestion ? `\n\n**Suggestion:** ${finding.suggestion}` : ''}`;
+    try {
+      await send('addDraftComment', { pullRequestId: data.id, path: finding.path, line: finding.line, body });
+      finding.state = 'posted';
+      saveAi(key, state.result);
+      toast('Added to your pending review. Submit it with "Finish your review" on GitHub (reload to see it there).');
+    } catch (err) {
+      toast(err.message);
+    }
+    if (ai === state) {
+      renderAi();
+      renderTabs();
+    }
+  }
+
+  function dismissFinding(finding) {
+    finding.state = 'dismissed';
+    saveAi(pr.key, ai.result);
+    renderAi();
+    renderTabs();
+  }
+
+  function jumpTo(path, line) {
+    const f = files.find((x) => x.path === path);
+    if (f) select(f, line);
+    else toast(`${path} isn't in this PR's file list.`);
+  }
+
+  function setTab(tab) {
+    prefs.tab = tab;
+    savePrefs();
+    renderTabs();
+  }
+
   function setOpen(open) {
     prefs.open = open;
     savePrefs();
@@ -209,7 +330,10 @@
   function render() {
     if (!host) return;
     renderSummary();
+    renderTabs();
     renderList();
+    renderThreads();
+    renderAi();
     renderLauncher();
   }
 
@@ -220,9 +344,17 @@
 
     const viewed = files.filter((f) => f.viewedState === 'VIEWED').length;
     const pct = files.length ? (viewed / files.length) * 100 : 0;
+    const left = RC.estimateMinutes(
+      files.filter((f) => !f.noise && f.viewedState !== 'VIEWED').reduce((n, f) => n + f.additions + f.deletions, 0),
+    );
     box.replaceChildren(
       h('div', { class: 'title', title: data.title }, h('span', { class: 'num' }, `#${data.number} `), data.title),
-      h('div', { class: 'meta' }, `@${data.author} · ${data.headRefName} → ${data.baseRefName}`),
+      h(
+        'div',
+        { class: 'meta' },
+        `@${data.author} · ${data.headRefName} → ${data.baseRefName}`,
+        left ? h('span', { title: 'Estimated at ~300 reviewed lines per hour, excluding generated files and lockfiles' }, ` · ≈${left} min left`) : null,
+      ),
       h(
         'div',
         { class: 'progress' },
@@ -273,6 +405,23 @@
     );
   }
 
+  function renderTabs() {
+    if (!host) return;
+    const threads = data?.threads.length ?? 0;
+    const open = ai.result?.findings.filter((f) => f.state === 'new').length ?? 0;
+    const counts = {
+      files: files.length ? `${files.filter((f) => f.viewedState !== 'VIEWED').length}` : '',
+      threads: threads ? `${threads}` : '',
+      ai: ai.running ? '…' : open ? `${open}` : '',
+    };
+    for (const [tab, button] of Object.entries(els.tabs)) {
+      button.classList.toggle('active', prefs.tab === tab);
+      button.setAttribute('aria-selected', String(prefs.tab === tab));
+      button.querySelector('.count').textContent = counts[tab];
+      els.views[tab].hidden = prefs.tab !== tab;
+    }
+  }
+
   function renderList() {
     if (!host) return;
     const list = visibleFiles();
@@ -283,11 +432,12 @@
     if (data && !list.length) {
       rows.push(h('div', { class: 'empty' }, files.length ? 'No files match your filters.' : 'No files changed.'));
     }
-    for (const cat of RC.CATEGORIES) {
-      const group = list.filter((f) => f.category === cat.id);
+    const grouping = GROUPINGS[prefs.sort] || GROUPINGS.risk;
+    for (const g of grouping.groups) {
+      const group = list.filter((f) => grouping.key(f) === g.id);
       if (!group.length) continue;
       const viewed = group.filter((f) => f.viewedState === 'VIEWED').length;
-      rows.push(h('div', { class: 'group' }, h('span', null, cat.label), h('span', null, `${viewed}/${group.length}`)));
+      rows.push(h('div', { class: `group group-${g.id}` }, h('span', null, g.label), h('span', null, `${viewed}/${group.length}`)));
       rows.push(...group.map(fileRow));
     }
     els.list.replaceChildren(...rows);
@@ -302,6 +452,7 @@
       e.stopPropagation();
       toggleViewed(f);
     });
+    const showRisk = f.risk.level !== 'low' && f.risk.reasons.length && !viewed;
     return h(
       'div',
       {
@@ -311,14 +462,145 @@
       },
       checkbox,
       h(
-        'span',
-        { class: 'path' },
-        slash >= 0 ? h('span', { class: 'dir' }, f.path.slice(0, slash + 1)) : null,
-        h('span', { class: 'name' }, f.path.slice(slash + 1)),
+        'div',
+        { class: 'file-main' },
+        h(
+          'span',
+          { class: 'path' },
+          slash >= 0 ? h('span', { class: 'dir' }, f.path.slice(0, slash + 1)) : null,
+          h('span', { class: 'name' }, f.path.slice(slash + 1)),
+        ),
+        showRisk ? h('span', { class: `reasons risk-${f.risk.level}` }, f.risk.reasons.join(' · ')) : null,
       ),
       isChanged(f) && !viewed ? h('span', { class: 'dot', title: 'Changed since you last viewed or reviewed it' }) : null,
       h('span', { class: `ct ct-${f.changeType.toLowerCase()}`, title: f.changeType.toLowerCase() }, CHANGE_LETTER[f.changeType] || 'M'),
       h('span', { class: 'stat' }, h('span', { class: 'add' }, `+${f.additions}`), ' ', h('span', { class: 'del' }, `−${f.deletions}`)),
+    );
+  }
+
+  function threadStatus(t) {
+    if (t.outdated) {
+      return h('span', { class: 'chip attention', title: 'The code under this comment changed after it was written. Check whether it was addressed.' }, 'code changed');
+    }
+    if (t.lastAuthor === data.author && t.author !== data.author) return h('span', { class: 'chip accent' }, 'author replied');
+    return h('span', { class: 'chip' }, 'open');
+  }
+
+  function renderThreads() {
+    if (!host) return;
+    const box = els.threadsList;
+    if (!data) return box.replaceChildren();
+    const threads = [...data.threads].sort(
+      (a, b) => (b.author === data.viewer) - (a.author === data.viewer) || b.outdated - a.outdated,
+    );
+    if (!threads.length) return box.replaceChildren(h('div', { class: 'empty' }, 'No unresolved conversations. 🎉'));
+    const changed = threads.filter((t) => t.outdated).length;
+    box.replaceChildren(
+      h('div', { class: 'view-note' }, `${threads.length} unresolved`, changed ? ` · ${changed} where the code has changed since` : ''),
+      ...threads.map((t) =>
+        h(
+          'a',
+          { class: 'thread', href: t.url || `/${pr.owner}/${pr.repo}/pull/${pr.number}/files` },
+          h('div', { class: 'thread-hd' }, threadStatus(t), h('span', { class: 'thread-path' }, t.line ? `${t.path}:${t.line}` : t.path)),
+          h('div', { class: 'thread-body' }, h('strong', null, `@${t.author}`), t.author === data.viewer ? ' (you)' : '', `: ${t.body}`),
+          t.replies
+            ? h('div', { class: 'muted small' }, `${t.replies} repl${t.replies === 1 ? 'y' : 'ies'} · last from @${t.lastAuthor}`)
+            : null,
+        ),
+      ),
+    );
+  }
+
+  function renderAi() {
+    if (!host) return;
+    const box = els.aiView;
+    if (!data) return box.replaceChildren(h('div', { class: 'empty' }, 'Loading pull request…'));
+    const { status, running, result, error: aiError } = ai;
+
+    if (status && !status.configured) {
+      return box.replaceChildren(
+        h(
+          'div',
+          { class: 'ai-pad' },
+          h(
+            'div',
+            { class: 'card' },
+            h('strong', null, 'Get a first-pass review from Claude'),
+            h(
+              'p',
+              null,
+              'Claude reads the diff (minus generated files and lockfiles) and lists likely bugs with file and line. You choose which ones become draft comments. Add your Anthropic API key in settings to turn it on.',
+            ),
+            h('button', { class: 'btn primary', onclick: () => send('openOptions') }, 'Add API key'),
+          ),
+        ),
+      );
+    }
+
+    const modelName = status?.modelName ?? 'Claude';
+    const parts = [
+      h(
+        'div',
+        { class: 'ai-bar' },
+        h('button', { class: 'btn primary', disabled: running, onclick: runAi }, running ? 'Reviewing…' : result ? 'Run again' : 'Run AI review'),
+        h(
+          'span',
+          { class: 'muted small' },
+          running ? `${modelName} is reading the diff. Usually 1–3 minutes.` : `${modelName} · sends the diff to Anthropic with your key`,
+        ),
+      ),
+    ];
+    if (aiError) {
+      parts.push(
+        h(
+          'div',
+          { class: 'card error' },
+          h('strong', null, 'AI review failed'),
+          h('p', null, aiError.message),
+          aiError.code === 'BAD_AI_KEY' || aiError.code === 'NO_AI_KEY'
+            ? h('button', { class: 'btn', onclick: () => send('openOptions') }, 'Open settings')
+            : null,
+        ),
+      );
+    }
+    if (result) {
+      if (result.headRefOid !== data.headRefOid) {
+        parts.push(h('div', { class: 'since' }, 'New commits were pushed after this AI review. Run it again to cover them.'));
+      }
+      parts.push(h('div', { class: 'ai-summary' }, h('div', { class: 'muted small' }, `${result.modelName} · ${RC.timeAgo(result.at)}`), result.summary));
+      const shown = result.findings.filter((f) => f.state !== 'dismissed');
+      if (!shown.length) parts.push(h('div', { class: 'empty' }, result.findings.length ? 'All findings dismissed.' : 'No issues found. 🎉'));
+      parts.push(...shown.map(findingCard));
+    } else if (!running && !aiError) {
+      parts.push(
+        h(
+          'p',
+          { class: 'muted ai-pad' },
+          'Claude lists likely bugs, security problems and missing tests. Nothing is posted until you choose "Add as draft comment" on a finding and then submit your review on GitHub.',
+        ),
+      );
+    }
+    box.replaceChildren(...parts);
+  }
+
+  function findingCard(f) {
+    return h(
+      'div',
+      { class: `finding sev-${f.severity}` },
+      h('div', { class: 'finding-hd' }, h('span', { class: `chip sev ${f.severity}` }, f.severity), h('strong', null, f.title)),
+      h('a', { class: 'loc', href: '#', onclick: (e) => { e.preventDefault(); jumpTo(f.path, f.line); } }, `${f.path}:${f.line}`),
+      h('div', { class: 'md' }, f.explanation),
+      f.suggestion ? h('div', { class: 'md suggestion' }, h('strong', null, 'Suggestion: '), f.suggestion) : null,
+      h(
+        'div',
+        { class: 'finding-actions' },
+        f.state === 'posted'
+          ? h('span', { class: 'add small' }, '✓ Added to your pending review')
+          : [
+              h('button', { class: 'btn small', onclick: (e) => postFinding(f, e.currentTarget) }, 'Add as draft comment'),
+              h('button', { class: 'btn small quiet', onclick: () => dismissFinding(f) }, 'Dismiss'),
+            ],
+      ),
     );
   }
 
@@ -333,7 +615,7 @@
     els.toast.textContent = message;
     els.toast.classList.add('show');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => els.toast.classList.remove('show'), 3000);
+    toastTimer = setTimeout(() => els.toast.classList.remove('show'), 3500);
   }
 
   function showText(text) {
@@ -407,17 +689,50 @@
     await applyStyles(shadow);
 
     const kbd = (k) => h('kbd', null, k);
+    const tab = (id, label) =>
+      h('button', { class: 'tab', role: 'tab', onclick: () => setTab(id) }, label, h('span', { class: 'count' }));
+
     els.root = shadow;
     els.summary = h('div', { class: 'summary' });
+    els.tabs = { files: tab('files', 'Files'), threads: tab('threads', 'Conversations'), ai: tab('ai', 'AI review') };
     els.search = h('input', { type: 'search', class: 'search', placeholder: 'Filter files…  (Alt+/)', spellcheck: 'false' });
+    els.sort = h(
+      'select',
+      { class: 'sort', title: 'How files are ordered' },
+      h('option', { value: 'risk' }, 'Riskiest first'),
+      h('option', { value: 'type' }, 'Group by type'),
+    );
+    els.sort.value = prefs.sort;
     els.hideNoise = h('input', { type: 'checkbox', checked: prefs.hideNoise });
     els.unviewedOnly = h('input', { type: 'checkbox', checked: prefs.unviewedOnly });
     els.noiseCount = h('span', { class: 'muted' });
-    els.list = h('div', { class: 'list', role: 'list' });
+    els.list = h('div', { class: 'list scroll', role: 'list' });
+    els.threadsList = h('div', { class: 'scroll' });
+    els.aiView = h('div', { class: 'scroll ai' });
+    els.views = {
+      files: h(
+        'div',
+        { class: 'view' },
+        h(
+          'div',
+          { class: 'tools' },
+          h('div', { class: 'tools-row' }, els.search, els.sort),
+          h(
+            'div',
+            { class: 'toggles' },
+            h('label', null, els.hideNoise, 'Hide generated & lockfiles', els.noiseCount),
+            h('label', null, els.unviewedOnly, 'Unviewed only'),
+          ),
+        ),
+        els.list,
+      ),
+      threads: h('div', { class: 'view' }, els.threadsList),
+      ai: h('div', { class: 'view' }, els.aiView),
+    };
     els.notes = h('textarea', { class: 'notes-input', placeholder: 'Private notes for this PR. Saved in your browser only.' });
     els.notesWrap = h('div', { class: 'notes', hidden: true }, els.notes);
     els.notesBtn = h('button', { class: 'btn', onclick: () => { els.notesWrap.hidden = !els.notesWrap.hidden; if (!els.notesWrap.hidden) els.notes.focus(); } }, 'Notes');
-    els.aiBtn = h('button', { class: 'btn', title: 'Copy the PR description and diff with a review prompt', onclick: copyForAi }, 'Copy for AI review');
+    els.aiBtn = h('button', { class: 'btn', title: 'Copy the PR description and diff with a review prompt, to paste into any AI tool', onclick: copyForAi }, 'Copy for AI');
 
     els.panel = h(
       'aside',
@@ -435,18 +750,8 @@
         ),
         els.summary,
       ),
-      h(
-        'div',
-        { class: 'tools' },
-        els.search,
-        h(
-          'div',
-          { class: 'toggles' },
-          h('label', null, els.hideNoise, 'Hide generated & lockfiles', els.noiseCount),
-          h('label', null, els.unviewedOnly, 'Unviewed only'),
-        ),
-      ),
-      els.list,
+      h('nav', { class: 'tabs', role: 'tablist' }, Object.values(els.tabs)),
+      ...Object.values(els.views),
       els.notesWrap,
       h(
         'footer',
@@ -482,6 +787,11 @@
       } else if (e.key === 'Escape') {
         els.search.blur();
       }
+    });
+    els.sort.addEventListener('change', () => {
+      prefs.sort = els.sort.value;
+      savePrefs();
+      renderList();
     });
     els.hideNoise.addEventListener('change', () => {
       prefs.hideNoise = els.hideNoise.checked;
@@ -537,6 +847,7 @@
         },
         Slash: () => {
           setOpen(true);
+          setTab('files');
           els.search.focus();
           els.search.select();
         },
@@ -570,7 +881,12 @@
       cursorPath = null;
       since = null;
       error = null;
-      mount().then(loadNotes);
+      ai = newAiState();
+      const target = pr;
+      mount().then(() => {
+        loadNotes();
+        loadAi(target);
+      });
       load();
     } else if (Date.now() - fetchedAt > 30_000) {
       load(); // switching tabs within the same PR: pick up new pushes / viewed state
@@ -590,6 +906,14 @@
     if (area !== 'local') return;
     if (changes.prefs?.newValue) Object.assign(prefs, changes.prefs.newValue);
     if (changes.token && pr) load();
+    if ((changes.anthropicKey || changes.aiModel) && pr) {
+      send('aiStatus')
+        .then((status) => {
+          ai.status = status;
+          renderAi();
+        })
+        .catch(() => {});
+    }
   });
 
   chrome.storage.local

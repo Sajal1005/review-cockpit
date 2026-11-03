@@ -46,6 +46,42 @@
     showConnected();
   });
 
+  // ---- AI review ----
+  const aiStatus = $('ai-status');
+
+  async function showAi() {
+    const { anthropicKey, aiModel } = await chrome.storage.local.get(['anthropicKey', 'aiModel']);
+    if (aiModel) $('ai-model').value = aiModel;
+    $('ai-remove').hidden = !anthropicKey;
+    $('ai-key').placeholder = anthropicKey ? '•••••••• (saved, paste a new one to replace it)' : 'sk-ant-…';
+    aiStatus.textContent = anthropicKey ? 'AI review is on.' : '';
+    aiStatus.className = 'status ok';
+  }
+
+  $('ai-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const key = $('ai-key').value.trim();
+    const update = { aiModel: $('ai-model').value };
+    if (key) {
+      if (!key.startsWith('sk-ant-')) {
+        aiStatus.textContent = 'That doesn\'t look like an Anthropic API key (they start with "sk-ant-").';
+        aiStatus.className = 'status err';
+        return;
+      }
+      update.anthropicKey = key;
+    }
+    await chrome.storage.local.set(update);
+    $('ai-key').value = '';
+    await showAi();
+    aiStatus.textContent = 'Saved.';
+  });
+
+  $('ai-remove').addEventListener('click', async () => {
+    await chrome.storage.local.remove('anthropicKey');
+    await showAi();
+    aiStatus.textContent = 'API key removed.';
+  });
+
   $('autoAdvance').addEventListener('change', async (e) => {
     const { prefs = {} } = await chrome.storage.local.get('prefs');
     await chrome.storage.local.set({ prefs: { ...prefs, autoAdvance: e.target.checked } });
@@ -55,4 +91,5 @@
     $('autoAdvance').checked = prefs.autoAdvance !== false;
   });
   showConnected();
+  showAi();
 })();
