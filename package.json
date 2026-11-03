@@ -1,0 +1,14 @@
+{
+  "name": "review-cockpit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A faster, keyboard-first pull request review experience layered on top of GitHub.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test",
+    "icons": "python scripts/make_icons.py"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

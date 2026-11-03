@@ -1,0 +1,44 @@
+body { background: var(--bg-muted); }
+
+.wrap { max-width: 720px; margin: 0 auto; padding: 32px 16px 48px; display: grid; gap: 16px; }
+
+.hero { display: flex; align-items: center; gap: 14px; margin-bottom: 4px; }
+.hero h1 { margin: 0; font-size: 22px; }
+.hero p { margin: 2px 0 0; }
+
+.card { padding: 18px 20px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; }
+.card h2 { margin: 0 0 8px; font-size: 15px; }
+.card p { margin: 0 0 10px; }
+.small { font-size: 12px; }
+
+.steps { margin: 0 0 14px; padding-left: 18px; display: grid; gap: 4px; }
+
+.token-row { display: flex; gap: 8px; }
+.token-row input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 10px;
+  font: 13px var(--mono);
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+}
+.token-row input:focus { border-color: var(--accent); }
+
+.status { min-height: 20px; margin: 8px 0; font-size: 12px; }
+.status.ok { color: var(--success); }
+.status.err { color: var(--danger); }
+.status.warn { color: var(--attention); }
+
+.keys { border-collapse: collapse; margin-bottom: 8px; }
+.keys td { padding: 4px 16px 4px 0; vertical-align: middle; }
+.keys td:first-child { white-space: nowrap; }
+
+.pref { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
+.pref input { margin-top: 3px; }
+
+@media (max-width: 520px) {
+  .token-row { flex-direction: column; }
+}

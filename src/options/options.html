@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Review Cockpit settings</title>
+    <link rel="stylesheet" href="../shared/ui.css" />
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="hero">
+        <img src="../../icons/icon128.png" alt="" width="48" height="48" />
+        <div>
+          <h1>Review Cockpit</h1>
+          <p class="muted">A faster, keyboard-first review experience on top of GitHub.</p>
+        </div>
+      </header>
+
+      <section class="card">
+        <h2>1. Connect GitHub</h2>
+        <p>
+          Review Cockpit uses the GitHub API to read pull requests and sync GitHub's own
+          <em>Viewed</em> checkboxes. Your token is stored only in this browser
+          (<code>chrome.storage.local</code>) and is only ever sent to <code>api.github.com</code>.
+        </p>
+        <ul class="steps">
+          <li>
+            <strong>Quickest:</strong>
+            <a href="https://github.com/settings/tokens/new?scopes=repo&amp;description=Review%20Cockpit" target="_blank" rel="noopener">create a classic token with the <code>repo</code> scope</a>.
+          </li>
+          <li>
+            <strong>Least privilege:</strong>
+            <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">create a fine-grained token</a>
+            with <em>Pull requests: Read and write</em> and <em>Contents: Read</em> on the repos you review.
+          </li>
+          <li>If your org uses SAML SSO, click <em>Configure SSO → Authorize</em> next to the token afterwards.</li>
+        </ul>
+
+        <form id="token-form" class="token-row">
+          <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="ghp_… or github_pat_…" />
+          <button class="btn primary" id="save" type="submit">Save &amp; verify</button>
+        </form>
+        <div id="status" class="status" role="status"></div>
+        <button class="btn danger" id="remove" type="button" hidden>Remove token</button>
+      </section>
+
+      <section class="card">
+        <h2>2. Review faster</h2>
+        <p>Open any pull request on github.com. The panel appears on the right.</p>
+        <table class="keys">
+          <tr><td><kbd>Alt</kbd> + <kbd>J</kbd> / <kbd>K</kbd></td><td>Next / previous file</td></tr>
+          <tr><td><kbd>Alt</kbd> + <kbd>N</kbd></td><td>Jump to the next unviewed file</td></tr>
+          <tr><td><kbd>Alt</kbd> + <kbd>V</kbd></td><td>Toggle <em>Viewed</em> on the current file (syncs with GitHub)</td></tr>
+          <tr><td><kbd>Alt</kbd> + <kbd>/</kbd></td><td>Filter files</td></tr>
+          <tr><td><kbd>Alt</kbd> + <kbd>R</kbd></td><td>Show / hide the panel</td></tr>
+        </table>
+        <p class="muted small">On macOS, <kbd>Alt</kbd> is the <kbd>⌥ Option</kbd> key.</p>
+      </section>
+
+      <section class="card">
+        <h2>Preferences</h2>
+        <label class="pref">
+          <input type="checkbox" id="autoAdvance" />
+          <span>After marking a file as viewed with <kbd>Alt</kbd>+<kbd>V</kbd>, jump to the next unviewed file</span>
+        </label>
+      </section>
+    </main>
+    <script src="../shared/ext.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

@@ -1,0 +1,10 @@
+/* Light-DOM styles: make room for the panel instead of covering the diff. */
+html.rc-panel-open body {
+  margin-right: 380px !important;
+}
+
+@media (max-width: 1180px) {
+  html.rc-panel-open body {
+    margin-right: 0 !important;
+  }
+}
